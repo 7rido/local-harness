@@ -1,0 +1,9 @@
+{
+  "current_time": "on",
+  "search_chats": "on",
+  "web_search": "off",
+  "web_fetch": "off",
+  "run_python": "off",
+  "memory": "off",
+  "search_never_send": []
+}

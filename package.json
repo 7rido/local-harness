@@ -1,0 +1,23 @@
+{
+  "name": "local-harness",
+  "version": "0.1.0",
+  "description": "A zero-dependency chat harness for a local LLM: streaming chat page, tools with trust levels, a full activity log, and checks that flag unverifiable specifics.",
+  "license": "MIT",
+  "private": false,
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node src/server.js --check",
+    "fake-model": "node examples/fake-model.js",
+    "test": "node --test test/"
+  },
+  "files": [
+    "src",
+    "examples",
+    "trust.example.json",
+    "README.md",
+    "LICENSE"
+  ]
+}

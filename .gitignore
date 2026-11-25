@@ -1,0 +1,7 @@
+data/
+trust.json
+.env
+*.log
+node_modules
+.DS_Store
+emergency_card.txt
