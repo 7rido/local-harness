@@ -218,11 +218,11 @@ test('the page polls the live view and shows the thinking as it is written', () 
   const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
   assert.match(html, /'\/api\/conv\/' \+ id \+ '\/live'/);
   assert.match(html, /Thinking \(as it is written\)/);
-  assert.match(html, /if \(busy \|\| r\.writing\) startLive\(\)/, 'replies started from another window show live too');
+  assert.match(html, /if \(busy \|\| r\.writing \|\| convThink\) startLive\(\)/, 'replies started from another window show live too');
   assert.match(html, /if \(busy \|\| convLive\) liveTimer = setTimeout\(liveTick, 700\);/);
   // The live start and end never force a redraw (an approval being edited is kept).
   assert.match(html, /else if \(convLive \|\| had\) await refresh\(\)\.catch/);
-  assert.match(html, /JSON\.stringify\(r\.recall_chats \|\| \{\}\) \+ Boolean\(convLive\) \+ JSON\.stringify\(r\.failed \|\| null\);/);
+  assert.match(html, /JSON\.stringify\(r\.think_harder \|\| null\) \+ Boolean\(convLive\) \+ JSON\.stringify\(r\.failed \|\| null\);/);
 });
 
 // A blank reply after the tool limit: asked with no tools offered, a model can end in a tool call and say nothing;
@@ -290,8 +290,8 @@ test('a reply the harness took raw tool-call markup out of is marked raw_call_re
 test('the page uses no browser pop-ups (some embedded browser panes answer them Cancel unseen)', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'src', 'public', 'index.html'), 'utf8');
   assert.ok(!/window\.(confirm|prompt|alert)\(|[^.\w](confirm|prompt|alert)\(/.test(html.replace(/function dialog[\s\S]*?const tell[^\n]*\n/, '')));
-  // Boxes that cannot be undone start on Cancel: every Forget, and deleting a chat's notes.
-  assert.strictEqual((html.match(/await askDanger\(/g) || []).length, 3);
+  // Boxes that cannot be undone start on Cancel: every Forget, and deleting a chat's notes or habits.
+  assert.strictEqual((html.match(/await askDanger\(/g) || []).length, 5);
   assert.ok(!/await ask\('Forget/.test(html));
   assert.match(html, /\(ta \|\| \(danger && c\) \|\| ok\)\.focus\(\);/);
 });

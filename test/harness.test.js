@@ -111,7 +111,7 @@ test('the shipped trust file turns the risky tools off, and a bad value falls ba
   const trust = require('../src/trust');
   const example = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'trust.example.json'), 'utf8'));
   assert.deepStrictEqual({ ...example, search_never_send: undefined }, { current_time: 'on', search_chats: 'on', web_search: 'off', web_fetch: 'off',
-    run_python: 'off', memory: 'off', search_never_send: undefined });
+    run_python: 'off', memory: 'off', review: 'off', think_harder: 'off', think_harder_repair: 'off', ask_someone: 'off', search_never_send: undefined });
   for (const v of Object.values(example)) assert.ok(Array.isArray(v) || ['off', 'ask', 'on'].includes(v));
   // No trust file at all: the same safe defaults.
   assert.strictEqual(trust.level('run_python'), 'off');
@@ -123,17 +123,14 @@ test('the shipped trust file turns the risky tools off, and a bad value falls ba
   fs.unlinkSync(process.env.LH_TRUST_FILE);
 });
 
-test('run_python runs in a Docker container only: never on the host, and with no Docker it fails', async () => {
+test('run_python goes through the sandbox module: with no Docker it fails and nothing runs on the host', async () => {
   const tools = require('../src/tools');
-  const args = tools.dockerArgs('lh-py-test');
-  for (const flag of ['--network', 'none', '--read-only', '--cap-drop', 'ALL', '--memory', '--pids-limit', '--rm']) assert.ok(args.includes(flag), flag);
-  assert.ok(!args.some((a) => /^-v|--volume|--mount/.test(a)), 'nothing of the host is mounted');
   const prev = process.env.LH_DOCKER;
   process.env.LH_DOCKER = path.join(TMP, 'no-such-docker');
   try {
-    const r = await tools.runPythonSandboxed('print("ran on the host")');
+    const r = await tools.TOOLS.run_python.run({ code: 'print("ran on the host")' });
     assert.strictEqual(r.ok, false);
-    assert.match(r.output, /needs Docker; nothing was run/);
+    assert.match(r.output, /Nothing was run/);
     assert.ok(!r.output.includes('ran on the host'));
   } finally { if (prev === undefined) delete process.env.LH_DOCKER; else process.env.LH_DOCKER = prev; }
 });

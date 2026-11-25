@@ -23,6 +23,12 @@ const memory = require('./memory');
 const { readCompletion } = require('./stream');
 const websearch = require('./websearch');
 const webfetch = require('./webfetch');
+const sandbox = require('./sandbox');
+const review = require('./review');
+const misses = require('./misses');
+const asks = require('./asks');
+const teacher = require('./teacher');
+const thinkharder = require('./thinkharder');
 
 const PORT = Number(process.env.LH_PORT || 8787);
 const MODEL_URL = (process.env.LH_MODEL_URL || 'http://127.0.0.1:8080').replace(/\/+$/, '');
@@ -132,7 +138,7 @@ function liveView(parts, d, toolNames) {
 // The model still saw both; only the activity log's copy changes.
 function redactHeldBack(messages) {
   const held = new Set(messages.filter((m) => m.role === 'tool' && typeof m.content === 'string'
-    && (websearch.isHeldBackText(m.content) || /^That page was not opened: its address had words about the person \(/.test(m.content)))
+    && (websearch.isHeldBackText(m.content) || /^That (?:page was not opened: its address|question was not sent: it) had words about the person \(/.test(m.content)))
     .map((m) => m.tool_call_id));
   if (!held.size) return messages;
   return messages.map((m) => {
@@ -140,18 +146,19 @@ function redactHeldBack(messages) {
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.some((c) => held.has(c.id))) {
       return { ...m, tool_calls: m.tool_calls.map((c) => (held.has(c.id)
         ? { ...c, function: { ...c.function, arguments: JSON.stringify((() => { const a = JSON.parse(c.function.arguments || '{}') || {};
-          return a.url != null ? { url_sha: lib.sha256(String(a.url)) } : { query_sha: lib.sha256(String(a.query || '')) }; })()) } } : c)) };
+          return a.url != null ? { url_sha: lib.sha256(String(a.url)) } : a.question != null ? { question_sha: lib.sha256(String(a.question)) } : { query_sha: lib.sha256(String(a.query || '')) }; })()) } } : c)) };
     }
     return m;
   });
 }
 
-async function callModel(convId, messages, info, { withTools = true, memBlock = null, hidden = [], onDelta = null } = {}) {
+async function callModel(convId, messages, info, { withTools = true, memBlock = null, habBlock = null, hidden = [], onDelta = null } = {}) {
   const offered = withTools ? tools.offeredSchemas() : [];
   logEvent(convId, {
     // The memory block and the model's note offers are logged as ids and a sha, never as text (memory.js rule 1).
-    type: 'model_call', messages: redactHeldBack(memory.redactMessages(messages, memBlock, hidden)), messages_sha: lib.sha256(JSON.stringify(messages)),
+    type: 'model_call', messages: redactHeldBack(review.redact(memory.redactMessages(messages, memBlock, hidden), habBlock)), messages_sha: lib.sha256(JSON.stringify(messages)),
     ...(memBlock ? { memory: { note_ids: memBlock.note_ids, sha: memBlock.sha, omitted: memBlock.omitted } } : {}),
+    ...(habBlock ? { habits: { ids: habBlock.ids, sha: habBlock.sha, omitted: habBlock.omitted } } : {}),
     model: info, temperature: TEMPERATURE, sampling: SAMPLING, max_tokens: MAX_TOKENS,
     tools_offered: offered.map((s) => s.function.name), trust: tools.trustLevels(),
   });
@@ -221,10 +228,43 @@ function failReason(err) {
   if (/stream ended/i.test(m)) return 'the model server stopped before the reply was finished';
   return 'something went wrong';
 }
+// Think harder: conv id -> { stage, done, total, started, repair } while a run is going, and the set of chats with one
+// queued or running (the page shows the progress line from these).
+const thinkProgress = new Map();
+const thinking = new Set();
+
 async function askModel(convId, opts = {}) {
+  if (opts.thinkHarder) thinking.add(convId);
   try { const saved = await answer(convId, opts); replyFailed.delete(convId); return saved; }
   catch (err) { replyFailed.set(convId, { reason: failReason(err), ts: new Date().toISOString() }); throw err; }
-  finally { liveReplies.delete(convId); }
+  finally { liveReplies.delete(convId); if (opts.thinkHarder) { thinking.delete(convId); thinkProgress.delete(convId); } }
+}
+
+// Think harder on one question: 8 tries, the model's own test inputs, the sandbox, the pick (thinkharder.js). Resolves
+// { ok: false, reason } without drawing anything when the sandbox is not there, so the reply can be a normal one.
+async function runThinkHarder(convId, messages, history, { repair }) {
+  const dock = await sandbox.available();
+  if (!dock.ok) return { ok: false, reason: `the sandbox is not available (${dock.why}), so the tries could not be checked` };
+  const started = Date.now();
+  const total = thinkharder.TRIES + 1;
+  thinkProgress.set(convId, { stage: 'starting', done: 0, total, started, repair });
+  logEvent(convId, { type: 'harness', event: 'think harder started', detail: repair ? 'repair on' : 'repair off' });
+  const prompt = history.filter((x) => x.author === 'user').map((x) => x.text).join('\n');
+  const r = await thinkharder.think({ messages, prompt, repair,
+    draw: async (m) => { const b = await callModelOnce(m, [], null); return (b.choices && b.choices[0]) || {}; },
+    onProgress: (p) => thinkProgress.set(convId, { ...p, started, repair }) });
+  const { choice, ...rest } = r;
+  // Every try, the test inputs and the checks go to the activity log; the chat keeps the reply that is shown.
+  logEvent(convId, { type: 'think_harder', messages_sha: lib.sha256(JSON.stringify(messages)), result: rest });
+  thinkProgress.set(convId, { ...(thinkProgress.get(convId) || {}), stage: r.ok ? 'saving' : 'fallback', reason: r.ok ? '' : r.reason });
+  return r;
+}
+
+// What the reply records about a think-harder run (the page shows it under the reply).
+function thinkHarderFacts(r, repairOn) {
+  if (!r.ok) return { ran: false, reason: r.reason };
+  return { ran: true, tries: r.tries, pick: r.pick, why: r.why, inputs: r.inputs.length, survivors: r.survivors.length,
+    repair_on: Boolean(repairOn), repaired: Boolean(r.repaired), seconds: r.seconds };
 }
 
 // A tool's web search or page read goes to its own log; returns the search log id (or null).
@@ -252,12 +292,15 @@ function logWeb(convId, call, outcome, { how = null } = {}) {
   return null;
 }
 
-async function answer(convId, { withTools = true } = {}) {
+async function answer(convId, { withTools = true, thinkHarder: th = false, repair = false } = {}) {
   const history = lib.readJsonl(convFile(convId));
   // The approved notes go after the system prompt, only when memory is on.
   const memBlock = memory.block();
   const memLive = memory.live();
-  const sys = memory.systemWith(systemPrompt(), memBlock);
+  // The habits you kept (review.js) go after the notes, only while review and memory are both on.
+  const habBlock = review.habitsBlock();
+  const withNotes = memory.systemWith(systemPrompt(), memBlock);
+  const sys = habBlock ? (withNotes ? `${withNotes}\n\n${habBlock.text}` : habBlock.text) : withNotes;
   const messages = lib.buildModelMessages(history, sys);
   const info = modelInfo();
   const asked = [...history].reverse().find((x) => x.author !== 'model'); // what the model is answering
@@ -271,6 +314,14 @@ async function answer(convId, { withTools = true } = {}) {
   const unraw = (x) => { const t = x.replace(RAW_CALL_BLOCK, ''); if (t !== x) rawRemoved = true; return t; };
   let body;
   let choice;
+  // Think harder: the picked try is the reply (no tools: the tries are plain replies). If it can't run, the model
+  // answers normally and the reply says why.
+  let thRun = null;
+  if (th) {
+    thRun = await runThinkHarder(convId, messages, history, { repair });
+    if (thRun.ok) { choice = thRun.choice || {}; body = { choices: [choice], usage: null, model: null }; }
+  }
+  const picked = Boolean(thRun && thRun.ok);
   // Tool loop: the model may call a tool; we decide by trust level, run it if allowed, hand it the
   // result and ask again, up to MAX_CALLS runs. Every attempt is logged, refused ones too.
   const ranCodes = new Set();
@@ -283,10 +334,10 @@ async function answer(convId, { withTools = true } = {}) {
   // before anything ran.
   const MAX_ATTEMPTS = tools.MAX_CALLS + 2;
   let ranCount = 0; let refusedCount = 0; let toldStop = false;
-  for (let step = 0; ; step++) {
+  for (let step = 0; !picked; step++) {
     const lastTry = toldStop;
     const toolNames = toolLog.map((t) => t.name);
-    body = await callModel(convId, messages, info, { withTools: withTools && !lastTry, memBlock, hidden,
+    body = await callModel(convId, messages, info, { withTools: withTools && !lastTry, memBlock, habBlock, hidden,
       onDelta: (d) => { liveReplies.set(convId, liveView(thinkingParts, d, toolNames)); } });
     choice = (body.choices && body.choices[0]) || {};
     const msg = choice.message || {};
@@ -316,9 +367,10 @@ async function answer(convId, { withTools = true } = {}) {
     if (/^ran/.test(outcome.decision || '')) ranCount += 1; else if (!toldStop) refusedCount += 1;
     // A note offer's text is kept only in the open approval until the user decides (memory.js rule 1).
     // A held-back search keeps neither the search words nor the matched words, here or in the search log.
-    const heldBack = Boolean((outcome.web && outcome.web.blocked) || (outcome.fetch && outcome.fetch.blocked));
+    const heldBack = Boolean((outcome.web && outcome.web.blocked) || (outcome.fetch && outcome.fetch.blocked) || (outcome.ask && outcome.ask.blocked));
     const loggedArgs = call.name === 'remember' ? { offer: outcome.approval_id || null }
       : heldBack && outcome.fetch ? { url_sha: lib.sha256(outcome.fetch.url) }
+        : heldBack && outcome.ask ? { question_sha: lib.sha256(outcome.ask.question) }
         : heldBack ? { query_sha: lib.sha256(outcome.web.query) } : call.args;
     // A page the model read: its text goes to the number and source checks (from memory, this reply only); the records
     // keep its address, size and a sha, never the text.
@@ -357,7 +409,7 @@ async function answer(convId, { withTools = true } = {}) {
   // the refusal it already knows (the limit message, or "not available"), then ask once more with no tools. Still
   // blank: saved as blank and marked, and the page says so (page text only; a blank reply never goes back into the context).
   let blankAfterRetry = false;
-  if (blankReply(choice)) {
+  if (!picked && blankReply(choice)) {
     const msg = choice.message || {};
     if (msg.reasoning) thinkingParts.push(unraw(msg.reasoning).trim());
     const call = tools.findCall(msg);
@@ -376,7 +428,7 @@ async function answer(convId, { withTools = true } = {}) {
       messages.push({ role: 'tool', tool_call_id: 'call_retry', content: entry.output });
     }
     const toolNames = toolLog.map((t) => t.name);
-    body = await callModel(convId, messages, info, { withTools: false, memBlock, hidden,
+    body = await callModel(convId, messages, info, { withTools: false, memBlock, habBlock, hidden,
       onDelta: (d) => { liveReplies.set(convId, liveView(thinkingParts, d, toolNames)); } });
     choice = (body.choices && body.choices[0]) || {};
     blankAfterRetry = blankReply(choice);
@@ -409,6 +461,8 @@ async function answer(convId, { withTools = true } = {}) {
     { name: 'your emergency card', text: emergencyCard() || '' },
     { name: 'you gave it', text: history.filter((m) => m.author === 'user').map((m) => m.text).join('\n') },
     { name: 'an approved tool run', text: history.filter((m) => m.author === 'tool').map((m) => m.text).join('\n') },
+    // The teacher's answer is something the model saw, like the user's own messages.
+    { name: 'the teacher said it', text: history.filter((m) => m.author === 'teacher').map((m) => m.text).join('\n') },
   ];
   const numberCheck = numbers.length ? lib.sourceNumbers(numbers, sawSources) : null;
   // The invented-source check: each source the model names ("X confirms", "according to X", "from official sources"),
@@ -418,12 +472,13 @@ async function answer(convId, { withTools = true } = {}) {
   // Medical or crisis if either the reply or the question it was answering is.
   const sensitive = check.sensitive || lib.checkFlags(asked ? asked.text : '').sensitive;
   const contextTokens = (body.usage && body.usage.prompt_tokens) || null;
-  const skipFacts = toolLog.length ? [] : lib.skipFacts(reply, { history, systemPrompt: sys, messages, contextTokens });
+  const skipFacts = toolLog.length || picked ? [] : lib.skipFacts(reply, { history, systemPrompt: sys, messages, contextTokens });
   // "Remembered: …": the notes in the model's context, and the ones its words probably drew on (shared words: a
   // guess, and the page says so). Ids only.
+  const habitIds = habBlock ? habBlock.ids : [];
   const memFacts = memBlock ? { live: true, note_ids: memBlock.note_ids, sha: memBlock.sha, omitted: memBlock.omitted,
-    likely: memory.likelyUsed(`${reply.text}\n${reply.thinking || ''}`, memBlock.note_ids) }
-    : memLive ? { live: true, note_ids: [], likely: [] } : null;
+    likely: memory.likelyUsed(`${reply.text}\n${reply.thinking || ''}`, memBlock.note_ids), habit_ids: habitIds }
+    : memLive ? { live: true, note_ids: [], likely: [], habit_ids: habitIds } : null;
   const facts = {
     ...(blankAfterRetry ? { blank_after_retry: true } : {}),
     ...(rawRemoved ? { raw_call_removed: true } : {}),
@@ -431,6 +486,7 @@ async function answer(convId, { withTools = true } = {}) {
     ...(numberCheck ? { numbers_found: numberCheck.found, numbers_unsourced: numberCheck.unsourced } : {}),
     ...(slips.length ? { arithmetic_slips: slips } : {}),
     ...(sourceCheck ? { sources_found: sourceCheck.found, sources_unsourced: sourceCheck.unsourced } : {}),
+    ...(thRun ? { think_harder: thinkHarderFacts(thRun, repair) } : {}),
     ...(memFacts ? { memory: memFacts } : {}),
     ...(recallRefs.length ? { recall: recallRefs } : {}),
   };
@@ -449,8 +505,40 @@ async function answer(convId, { withTools = true } = {}) {
     ...facts,
     model: { ...info, served: body.model || null }, sampling: SAMPLING,
   });
+  // Arithmetic the model stated that does not work out becomes a miss for the review (only when review is switched on,
+  // and only for a question you asked yourself).
+  if (review.status().switched_on && asked && asked.author === 'user') {
+    for (const a of slips.filter((x) => !x.quoted)) {
+      const rec = misses.logMiss({ convId, questionId: asked.id, replyId: saved.id, prompt: asked.text, reply: reply.text,
+        check: { kind: 'rule:arithmetic', detail: a.expr, claimed: a.claimed, expected: a.actual } });
+      if (rec) logEvent(convId, { type: 'harness', event: 'miss logged', detail: `${a.expr} = ${a.actual}, the model said ${a.claimed}` });
+    }
+  }
   websearch.noteOutcome(webIds, reply.text);   // which result links the answer named
   return saved;
+}
+
+// ---- The review ----
+// One run at a time. Each of the model's review replies waits its turn behind chat replies (serial), so a chat is never
+// blocked for the whole run.
+let reviewError = null;
+async function reviewCall(messages) {
+  const res = await fetch(`${MODEL_URL}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...(MODEL_NAME ? { model: MODEL_NAME } : {}), messages, max_tokens: MAX_TOKENS, ...SAMPLING, stream: false }),
+    signal: AbortSignal.timeout(MODEL_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`model server answered ${res.status}`);
+  // A fixed message if the body isn't JSON, so none of the server's text reaches the run log.
+  let body;
+  try { body = await res.json(); } catch { throw new Error('the model server sent a reply that was not JSON'); }
+  return (body.choices && body.choices[0]) || {};
+}
+function startReview() {
+  reviewError = null;
+  review.run({ call: (messages) => serial(() => reviewCall(messages)),
+    convExists: (id) => validConvId(id) && fs.existsSync(convFile(id)), info: modelInfo() })
+    .catch((err) => { reviewError = failReason(err) === 'something went wrong' ? String(err.message || err) : failReason(err); });
 }
 
 // ---- HTTP ----
@@ -505,7 +593,9 @@ function makeServer(token, { allowedHosts = bind.allowedHostHeaders({ loopback: 
         const active = await pingModel();
         const levels = tools.trustLevels();
         return send(res, 200, { model: modelInfo(), model_url: MODEL_URL, model_up: active.up,
-          system_prompt: Boolean(systemPrompt().trim()), memory: memory.status(), long_context_tokens: lib.LONG_CONTEXT_TOKENS,
+          system_prompt: Boolean(systemPrompt().trim()), memory: memory.status(), review: review.status(), long_context_tokens: lib.LONG_CONTEXT_TOKENS,
+          think_harder: { on: trust.level('think_harder') !== 'off', repair: trust.level('think_harder_repair') !== 'off' },
+          teacher: { name: lib.AUTHORS.teacher.label, endpoint: teacher.configured() },
           tools: Object.keys(tools.TOOLS).map((name) => ({ name, trust: levels[name] })),
           // The user's own reference card, shown on medical/crisis replies. Empty unless the user writes emergency_card.txt
           // with numbers they have verified themselves.
@@ -573,6 +663,27 @@ function makeServer(token, { allowedHosts = bind.allowedHostHeaders({ loopback: 
           return send(res, 200, { approval: apr });
         }
         // Approved as written, or approved after the user edited it.
+        if (apr.name === 'ask_someone') {
+          // The exact question you saw is the one sent (an edit is ignored). The guard runs once more before anything leaves.
+          const g = await tools.runApproved('ask_someone', apr.args, { convId: apr.conv_id });
+          if (g.blocked) {
+            logEvent(apr.conv_id, { type: 'harness', event: 'question held back by the guard', detail: `question_sha ${lib.sha256(String(apr.args.question || ''))}` });
+            approvals.setApprovalArgs(apr.id, { question_sha: lib.sha256(String(apr.args.question || '')) });
+            return send(res, 200, { approval: { ...apr, args: {} }, held_back: true });
+          }
+          const ask = asks.addAsk({ convId: apr.conv_id, question: g.ask.question, approvalId: apr.id });
+          logEvent(apr.conv_id, { type: 'harness', event: 'question approved', detail: `ask ${ask.id}, question_sha ${lib.sha256(ask.question)}` });
+          if (!teacher.configured()) return send(res, 200, { approval: apr, ask });
+          // With an endpoint set, the question text leaves this computer for that URL.
+          const t = await teacher.ask(ask.question);
+          if (!t.ok) {
+            logEvent(apr.conv_id, { type: 'harness', event: 'teacher endpoint failed', detail: t.error });
+            return send(res, 200, { approval: apr, ask, teacher_error: t.error });
+          }
+          asks.closeAsk(ask.id, 'endpoint');
+          addMessage(apr.conv_id, 'teacher', t.text, { ask_id: ask.id });
+          return replyTo(res, apr.conv_id, { approval: apr, ask: { ...ask, status: 'answered' } });
+        }
         const edited = Boolean(b.args && JSON.stringify(b.args) !== JSON.stringify(apr.args));
         const args = edited ? b.args : apr.args;
         const result = await tools.runApproved(apr.name, args, { convId: apr.conv_id });
@@ -603,13 +714,15 @@ function makeServer(token, { allowedHosts = bind.allowedHostHeaders({ loopback: 
       if (req.method === 'POST' && url.pathname === '/api/forget') {
         const b = await readBody(req);
         if (!validConvId(b.conv_id) || !fs.existsSync(convFile(b.conv_id))) return send(res, 404, { error: 'no such conversation' });
-        const removed = { approvals: approvals.forgetConv(b.conv_id) };
+        const removed = { approvals: approvals.forgetConv(b.conv_id), asks: asks.forgetConv(b.conv_id), misses: misses.deleteMisses({ convId: b.conv_id }) };
         websearch.forget(b.conv_id);   // searches from this chat leave the search log too
         webfetch.forget(b.conv_id);    // and the pages read
         setChatMeta(b.conv_id, { title: null, pinned: false, archived: false });   // and its title, pin and archive mark
         for (const file of [convFile(b.conv_id), logFile(b.conv_id), logMdFile(b.conv_id)]) { try { fs.unlinkSync(file); } catch {} }
-        // Notes that came from this chat stay until the user deletes them: the page asks.
-        return send(res, 200, { forgotten: b.conv_id, removed, notes_from_chat: memory.fromChat(b.conv_id) });
+        // Its review cases are deleted; a habit kept from it loses its links to the chat. Notes and habits that came from this
+        // chat stay until you delete them: the page asks.
+        const habitsFromChat = review.prune((id) => validConvId(id) && fs.existsSync(convFile(id)));
+        return send(res, 200, { forgotten: b.conv_id, removed, notes_from_chat: memory.fromChat(b.conv_id), habits_from_chat: habitsFromChat });
       }
       // The Memory page: the user sees, adds, edits and really deletes notes.
       if (req.method === 'GET' && url.pathname === '/api/memory') return send(res, 200, { status: memory.status(), notes: memory.list() });
@@ -626,6 +739,61 @@ function makeServer(token, { allowedHosts = bind.allowedHostHeaders({ loopback: 
       if (req.method === 'POST' && url.pathname === '/api/memory/delete') {
         const b = await readBody(req);
         return memory.remove(b.id) ? send(res, 200, { deleted: b.id }) : send(res, 404, { error: 'no such note' });
+      }
+      // Mark a reply wrong and give the right answer: a miss for the review. The correct answer is used only to check the model later.
+      if (req.method === 'POST' && url.pathname === '/api/miss') {
+        const b = await readBody(req);
+        if (!review.status().switched_on) return send(res, 400, { error: 'the review is off ("review": "on" in trust.json turns it on)' });
+        if (!validConvId(b.conv_id) || !fs.existsSync(convFile(b.conv_id))) return send(res, 404, { error: 'no such conversation' });
+        if (typeof b.expected !== 'string' || !b.expected.trim()) return send(res, 400, { error: 'give the right answer' });
+        const msgs = lib.readJsonl(convFile(b.conv_id));
+        const i = msgs.findIndex((x) => x.id === b.message_id && x.author === 'model');
+        if (i < 0) return send(res, 404, { error: 'no such reply' });
+        const q = msgs.slice(0, i).reverse().find((x) => x.author === 'user');
+        if (!q) return send(res, 400, { error: 'only replies to your own questions can be logged' });
+        const rec = misses.logMiss({ convId: b.conv_id, questionId: q.id, replyId: msgs[i].id, prompt: q.text, reply: msgs[i].text,
+          check: { kind: 'user', detail: 'marked by you', expected: b.expected.trim() } });
+        if (rec) logEvent(b.conv_id, { type: 'harness', event: 'miss logged', detail: 'marked by you' });
+        return send(res, 200, { miss: rec, already: !rec });
+      }
+      // Review: the model proposes habits, you decide.
+      if (req.method === 'GET' && url.pathname === '/api/review') {
+        const cases = review.list();
+        return send(res, 200, { status: review.status(), progress: review.progress(), error: reviewError, cases,
+          chats: Object.fromEntries([...new Set(cases.map((c) => c.conv_id).filter(Boolean))]
+            .filter((id) => validConvId(id) && fs.existsSync(convFile(id))).map((id) => [id, chatTitle(id)])) });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/review/run') {
+        if (!review.live()) return send(res, 400, { error: `the review is off: ${review.status().why_off}` });
+        if (review.running()) return send(res, 200, { already: true });
+        if (!(await pingModel()).up) return send(res, 400, { error: `the model server is not answering at ${MODEL_URL}, so there is nothing to ask. Start it and press Review again.` });
+        startReview();
+        return send(res, 200, { started: true });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/review/decide') {
+        const b = await readBody(req);
+        try { const c = review.decide(b.id, b.decision, { kind: b.kind, habit: b.habit }); return c ? send(res, 200, { case: c }) : send(res, 404, { error: 'no such case waiting' }); }
+        catch (e) { return send(res, 400, { error: String(e.message || e) }); }
+      }
+      if (req.method === 'POST' && url.pathname === '/api/review/edit') {
+        const b = await readBody(req);
+        try { const c = review.edit(b.id, { kind: b.kind, habit: b.habit }); return c ? send(res, 200, { case: c }) : send(res, 404, { error: 'no such habit' }); }
+        catch (e) { return send(res, 400, { error: String(e.message || e) }); }
+      }
+      if (req.method === 'POST' && url.pathname === '/api/review/delete') {
+        const b = await readBody(req);
+        return review.remove(b.id) ? send(res, 200, { deleted: b.id }) : send(res, 404, { error: 'no such habit' });
+      }
+      // ask_someone: open questions, and an answer from a person or program (node src/cli.js answer).
+      if (req.method === 'GET' && url.pathname === '/api/asks') return send(res, 200, { asks: asks.listAsks(url.searchParams.get('open') === '1') });
+      if (req.method === 'POST' && url.pathname === '/api/ask/answer') {
+        const b = await readBody(req);
+        if (typeof b.text !== 'string' || !b.text.trim()) return send(res, 400, { error: 'empty answer' });
+        const open = asks.listAsks(true).find((x) => x.id === b.id);
+        if (!open || !validConvId(open.conv_id) || !fs.existsSync(convFile(open.conv_id))) return send(res, 404, { error: 'no such open question' });
+        const ask = asks.closeAsk(b.id, 'cli');
+        const msg = addMessage(ask.conv_id, 'teacher', b.text.trim(), { ask_id: ask.id });
+        return replyTo(res, ask.conv_id, { sent: msg });
       }
       if (req.method === 'POST' && url.pathname === '/api/new') {
         const id = lib.newId('c');
@@ -647,14 +815,18 @@ function makeServer(token, { allowedHosts = bind.allowedHostHeaders({ loopback: 
           if (msg.author !== 'model') return msg;
           const c = lib.checkFlags(msg.text);
           const q = raw.slice(0, i).reverse().find((x) => x.author !== 'model');
-          const people = raw.slice(0, i).filter((x) => x.author !== 'model').map((x) => x.text);
+          const people = raw.slice(0, i).filter((x) => x.author === 'user' || x.author === 'tool').map((x) => x.text);
           const marks = lib.markReply(msg.text, msg.tools || [], people, systemPrompt());
           return { ...msg, check_flags: c.flags, sensitive: c.sensitive || lib.checkFlags(q ? q.text : '').sensitive,
             marks: marks.sentences, stated_confidence: marks.stated_confidence };
         });
         return send(res, 200, { conv_id: m[1], messages,
           writing: liveReplies.has(m[1]), failed: replyFailed.get(m[1]) || null,
-          approvals: approvals.listApprovals(m[1]),
+          approvals: approvals.listApprovals(m[1]), asks: asks.listAsks(true).filter((x) => x.conv_id === m[1]),
+          think_harder: thinkProgress.get(m[1]) || (thinking.has(m[1]) ? { stage: 'queued', done: 0, total: thinkharder.TRIES + 1 } : null),
+          // The habits the replies here had in context (a forgotten habit is simply missing).
+          habits: Object.fromEntries([...new Set(messages.flatMap((x) => (x.memory && x.memory.habit_ids) || []))]
+            .map((id) => [id, review.get(id)]).filter(([, h]) => h && h.status === 'kept').map(([id, h]) => [id, { kind: h.kind, habit: h.habit }])),
           // The notes the replies here had in context (a deleted note shows as forgotten on the page).
           notes: Object.fromEntries([...new Set(messages.flatMap((x) => (x.memory && x.memory.note_ids) || []))]
             .map((id) => [id, memory.get(id)]).filter(([, n]) => n)),
@@ -672,7 +844,18 @@ function makeServer(token, { allowedHosts = bind.allowedHostHeaders({ loopback: 
         replyFailed.delete(b.conv_id);
         if (b.reply === false) return send(res, 200, { sent: msg });
         // "Chat" mode in the page sends tools: false, so no tools are offered for this reply.
-        return replyTo(res, b.conv_id, { sent: msg }, b.tools !== false);
+        const withTools = b.tools !== false;
+        if (b.think_harder === true) {
+          // Think harder takes about nine replies' worth of time: answer the request now and deliver the reply through the
+          // page's refresh, so a dropped request never starts a second run.
+          if (trust.level('think_harder') === 'off') return send(res, 400, { error: 'think harder is off ("think_harder": "on" in trust.json turns it on)', sent: msg });
+          const repair = b.repair === true && trust.level('think_harder_repair') !== 'off';
+          thinking.add(b.conv_id);
+          serial(() => askModel(b.conv_id, { withTools, thinkHarder: true, repair }))
+            .catch((err) => logEvent(b.conv_id, { type: 'harness', event: 'think harder failed', detail: String((err && err.message) || err) }));
+          return send(res, 200, { sent: msg, think_harder: { started: true, repair } });
+        }
+        return replyTo(res, b.conv_id, { sent: msg }, withTools);
       }
       return send(res, 404, { error: 'not found' });
     } catch (err) {

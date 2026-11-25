@@ -4,8 +4,9 @@
 //   ask   the model may call it, but the call waits for the user's yes (an approval card in the page)
 //   on    the call runs by itself, and is shown under the reply
 //
-// "memory" is a feature switch rather than one tool: "off", or "ask"/"on" (both mean on; the
-// model's note offers always wait for the user's yes either way).
+// "memory", "review", "think_harder" and "think_harder_repair" are feature switches rather than tools: "off", or
+// "ask"/"on" (both mean on; the model's note offers always wait for the user's yes either way).
+// "ask_someone" always asks: "on" behaves as "ask".
 //
 // Other keys in trust.json:
 //   search_never_send   a list of words (your name, a street, a project name) that may never appear
@@ -18,7 +19,8 @@ const path = require('node:path');
 const lib = require('./lib');
 
 const LEVELS = ['off', 'ask', 'on'];
-const DEFAULTS = { current_time: 'on', search_chats: 'on', web_search: 'off', web_fetch: 'off', run_python: 'off', memory: 'off' };
+const DEFAULTS = { current_time: 'on', search_chats: 'on', web_search: 'off', web_fetch: 'off', run_python: 'off', memory: 'off',
+  review: 'off', think_harder: 'off', think_harder_repair: 'off', ask_someone: 'off' };
 
 const file = () => process.env.LH_TRUST_FILE || path.join(lib.projectRoot(), 'trust.json');
 

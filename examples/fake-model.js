@@ -8,6 +8,10 @@
 //   - echoes your message back, after a short made-up "thinking" (sent in the `reasoning` field, as mlx_lm.server does)
 //   - if your message mentions "time" and the harness offers current_time, it calls that tool, then reports the result
 //   - if your message contains "raw call", it writes a raw <tool_call> block into its text, as some models do
+//   - if your message mentions is_prime (a coding question), it answers with a Python function, a different version each time, one in four
+//     with a bug; asked for test inputs or a repair, it answers those too. Use it to try "Think harder" (needs trust.json think_harder + Docker).
+//   - if your message contains "ask someone" and the harness offers ask_someone, it asks a question through that tool
+//   - when the harness asks it to review its mistakes, it names a made-up kind of mistake and habit, so you can see the Review page work
 //   - if your message contains "slow", it streams word by word with pauses, so you can watch the live view
 // It knows nothing and checks nothing; it is only here to show how the harness behaves.
 
@@ -21,11 +25,22 @@ const HOST = process.env.FAKE_MODEL_HOST || '127.0.0.1';
 const lastOf = (messages, role) => [...messages].reverse().find((m) => m.role === role);
 const textOf = (m) => (m && typeof m.content === 'string' ? m.content : '');
 
+const GOOD = 'def is_prime(n):\n    if n < 2:\n        return False\n    i = 2\n    while i * i <= n:\n        if n % i == 0:\n            return False\n        i += 1\n    return True';
+const BUGGY = 'def is_prime(n):\n    return n > 1 and all(n % i for i in range(2, n // 2))';
+let codeCalls = 0;
+const fence = (c) => `Here is a version.\n\`\`\`python\n${c}\n\`\`\``;
+
 // What the fake model decides to do for one request.
 function plan(body) {
   const messages = body.messages || [];
   const last = messages[messages.length - 1] || {};
   const user = textOf(lastOf(messages, 'user'));
+  if (/write test inputs/i.test(textOf(last))) return { reasoning: 'I will list a few calls.', content: '```python\nis_prime(2)\nis_prime(9)\nis_prime(1)\nis_prime(97)\nis_prime(15)\n```' };
+  if (/Your solution failed/.test(textOf(last))) return { reasoning: 'Fixing it.', content: fence(GOOD) };
+  if (/\bis_prime\b/.test(user)) return { reasoning: 'A coding question. I will write the function.', content: fence(++codeCalls % 4 === 0 ? BUGGY : GOOD) };
+  const whole = messages.map((m) => textOf(m)).join('\n');
+  if (/write only "NONE"/.test(whole)) return { reasoning: 'Looking back.', content: 'NONE' };
+  if (/Write exactly two lines/.test(whole)) return { reasoning: 'Naming it.', content: 'KIND: Careless sums\nHABIT: Recheck every sum with the calculator tool before stating it' };
   const offered = new Set((body.tools || []).map((t) => t.function && t.function.name));
   if (last.role === 'tool') {
     return { reasoning: 'A tool answered. I will pass its output on.', content: `The tool said: ${textOf(last).slice(0, 300)}` };
@@ -33,6 +48,9 @@ function plan(body) {
   if (/raw call/i.test(user) && offered.has('current_time')) {
     return { reasoning: 'I will call the clock the raw way.',
       content: 'Checking the clock.\n<tool_call>\n<function=current_time>\n</function>\n</tool_call>' };
+  }
+  if (/ask someone/i.test(user) && offered.has('ask_someone')) {
+    return { reasoning: 'I am unsure. I will ask.', tool: { name: 'ask_someone', arguments: JSON.stringify({ question: 'What is the boiling point of water at sea level, in degrees Celsius?' }) } };
   }
   if (/\btime\b/i.test(user) && offered.has('current_time')) {
     return { reasoning: 'The user asks about the time. I should use the clock tool.', tool: { name: 'current_time', arguments: '{}' } };

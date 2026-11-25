@@ -7,6 +7,8 @@
 //   node src/cli.js send <conv_id> "text" [--thinking]
 //   node src/cli.js show <conv_id> [--thinking]
 //   node src/cli.js log <conv_id>
+//   node src/cli.js asks                       open questions the model put to a teacher (ask_someone)
+//   node src/cli.js answer <ask_id> "text"      answer one; the model then replies
 
 'use strict';
 
@@ -37,7 +39,7 @@ async function call(method, route, body) {
 }
 
 function printMessage(m, showThinking) {
-  const who = m.author === 'model' ? 'model' : m.author === 'tool' ? 'tool result' : 'you';
+  const who = m.author === 'model' ? 'model' : m.author === 'tool' ? 'tool result' : m.author === 'teacher' ? (lib.AUTHORS.teacher.label) : 'you';
   if (m.author === 'model' && showThinking && m.thinking) console.log(`[thinking]\n${m.thinking}\n[/thinking]`);
   console.log(`${who}: ${m.text || '(no answer)'}`);
   if (m.author === 'model') console.log(`  (first move: ${m.first_move}; finished: ${m.finished ? 'yes' : 'no'})`);
@@ -62,10 +64,20 @@ async function main(argv) {
   } else if (cmd === 'show') {
     const r = await call('GET', `/api/conv/${args[0]}`);
     r.messages.forEach((m) => printMessage(m, flags.has('--thinking')));
+  } else if (cmd === 'asks') {
+    const r = await call('GET', '/api/asks?open=1');
+    if (!r.asks.length) console.log('no open questions');
+    r.asks.forEach((a) => console.log(`${a.id}  [${a.conv_id}]  ${a.question}`));
+  } else if (cmd === 'answer') {
+    const [id, text] = args;
+    if (!id || !text) throw new Error('usage: answer <ask_id> "text"');
+    const r = await call('POST', '/api/ask/answer', { id, text });
+    if (r.reply) printMessage(r.reply, flags.has('--thinking'));
+    else console.log(`answered; no reply from the model: ${r.failed ? r.failed.reason : 'unknown'}`);
   } else if (cmd === 'log') {
     console.log(await call('GET', `/api/conv/${args[0]}/log`));
   } else {
-    console.log('commands: list | new | send <conv> "text" [--thinking] | show <conv> [--thinking] | log <conv>');
+    console.log('commands: list | new | send <conv> "text" [--thinking] | show <conv> [--thinking] | log <conv> | asks | answer <ask_id> "text"');
     process.exitCode = cmd ? 1 : 0;
   }
 }

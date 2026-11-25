@@ -4,13 +4,11 @@
 //   ask   the call waits for the user's yes (an approval record, shown in the page); the user may edit it first
 //   on    runs by itself; every run is logged and shown under the reply
 //
-// Tools: current_time, search_chats, web_search, web_fetch, run_python, remember.
+// Tools: current_time, search_chats, web_search, web_fetch, run_python, remember, ask_someone.
 
 'use strict';
 
 const os = require('node:os');
-const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
 const lib = require('./lib');
 const trust = require('./trust');
 const approvals = require('./approvals');
@@ -18,6 +16,7 @@ const memory = require('./memory');
 const recall = require('./recall');
 const websearch = require('./websearch');
 const webfetch = require('./webfetch');
+const sandbox = require('./sandbox');
 
 const NETWORK_CODE = /\b(socket|urllib|requests|http\.client|urlopen|httpx|aiohttp|ftplib|smtplib)\b/;
 const MAX_CALLS = 3;
@@ -34,50 +33,10 @@ const FETCH_TEXT = {
   cut: '\n\n[The page was longer; only the first part is shown.]',
 };
 
-// ---- run_python: a Docker container, never the host ----
-// Model-written code runs only inside a throwaway container with no network, a read-only filesystem, memory and
-// process limits, no capabilities, and nothing of the host mounted. If Docker is missing the tool fails with a
-// message; it never falls back to running the code on the host.
-const PY_IMAGE = () => process.env.LH_PYTHON_IMAGE || 'python:3.12-slim';
-const DOCKER = () => process.env.LH_DOCKER || 'docker';
-const PY_TIMEOUT_MS = 10000;
-const PY_MAX_CODE = 20000;
-const PY_MAX_OUTPUT = 4000;
-
-function dockerArgs(name) {
-  return ['run', '--rm', '-i', '--name', name, '--network', 'none', '--memory', '256m', '--cpus', '1', '--pids-limit', '64',
-    '--read-only', '--tmpfs', '/tmp:rw,size=16m', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-    '--user', '65534:65534', PY_IMAGE(), 'python', '-I', '-'];
-}
-
-function runPythonSandboxed(code) {
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    const secs = () => Math.round((Date.now() - t0) / 10) / 100;
-    if (!code.trim()) return resolve({ output: 'no code given', ok: false, seconds: 0 });
-    if (code.length > PY_MAX_CODE) return resolve({ output: `the program is too long (over ${PY_MAX_CODE} characters)`, ok: false, seconds: 0 });
-    const name = `lh-py-${crypto.randomBytes(6).toString('hex')}`;
-    let out = ''; let err = ''; let settled = false;
-    const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
-    const clip = (s) => (s.length > PY_MAX_OUTPUT ? `${s.slice(0, PY_MAX_OUTPUT)}\n[output cut]` : s);
-    let child;
-    try { child = spawn(DOCKER(), dockerArgs(name), { stdio: ['pipe', 'pipe', 'pipe'] }); }
-    catch (e) { return resolve({ output: dockerMissing(e), ok: false, seconds: 0 }); }
-    const timer = setTimeout(() => {
-      // Remove the container by name; best effort.
-      try { spawn(DOCKER(), ['rm', '-f', name], { stdio: 'ignore' }); } catch {}
-      try { child.kill('SIGKILL'); } catch {}
-      done({ output: `timed out after ${PY_TIMEOUT_MS / 1000} s`, ok: false, seconds: secs() });
-    }, PY_TIMEOUT_MS);
-    child.stdout.on('data', (d) => { if (out.length < PY_MAX_OUTPUT * 2) out += d; });
-    child.stderr.on('data', (d) => { if (err.length < PY_MAX_OUTPUT * 2) err += d; });
-    child.on('error', (e) => done({ output: dockerMissing(e), ok: false, seconds: secs() }));
-    child.on('close', (code2) => done({ output: clip((out + (err ? `${out ? '\n' : ''}${err}` : '')).trim()) || '(no output)', ok: code2 === 0, seconds: secs() }));
-    child.stdin.on('error', () => {});
-    child.stdin.end(code);
-  });
-}
-const dockerMissing = (e) => `the sandbox could not start (${e && e.code === 'ENOENT' ? 'the docker command was not found' : String((e && e.message) || e)}). run_python needs Docker; nothing was run.`;
+const ASK_TEXT = {
+  held: (words) => `That question was not sent: it had words about the person (${words}). Ask again without them, or answer without asking.`,
+  waiting: 'Your question has been shown to the person. If they approve it, the answer may arrive later in this chat as a message from the teacher. For now, tell the person you have asked, and say what you think so far.',
+};
 
 const TOOLS = {
   run_python: {
@@ -98,7 +57,7 @@ const TOOLS = {
         },
       },
     },
-    run: (args) => runPythonSandboxed(String(args.code || '')),
+    run: (args) => sandbox.run(String(args.code || '')),
   },
   // Reads this computer's clock and nothing else. As a tool the model has to reach for it, and the log shows
   // whether it does, instead of inventing a time.
@@ -168,6 +127,31 @@ const TOOLS = {
       // user_text: only the user's side of what the model was shown, for the number and source checks (never logged).
       return { output: recall.render(results), ok: true, seconds: (Date.now() - t0) / 1000, recall: recall.refs(results),
         user_text: results.map((r) => recall.cut(r.user || '', recall.MAX_USER)).join('\n') };   // as cut for the model
+    },
+  },
+  // The model puts one question to a second voice. It always asks you first (at "on" it still asks), the exact question is
+  // shown on the approval card, and the search guard checks the words first. The answer comes back as a "teacher" turn:
+  // from an endpoint (LH_TEACHER_URL) or from a person or program using `node src/cli.js answer`.
+  ask_someone: {
+    trustKey: 'ask_someone',
+    alwaysAsk: true,
+    schema: {
+      type: 'function',
+      function: {
+        name: 'ask_someone',
+        description: 'Ask someone else one question when you are unsure and cannot check it yourself. The person sees your question and ' +
+          'decides whether it is sent. The answer may come back later in this chat as a message from the teacher. Leave out anything ' +
+          'about the person: the question is sent to someone else.',
+        parameters: { type: 'object', properties: { question: { type: 'string', description: 'The question to ask' } }, required: ['question'] },
+      },
+    },
+    run: async (args) => {
+      const question = String(args.question || '').trim();
+      if (!question) return { output: 'no question given', ok: false, seconds: 0 };
+      const g = websearch.guard(question, guardSources());
+      if (g) return { output: ASK_TEXT.held(g.matched), ok: false, seconds: 0, blocked: true,
+        ask: { question, blocked: { kind: g.kind, note_id: g.note_id || null } } };
+      return { output: 'question accepted', ok: true, seconds: 0, ask: { question } };
     },
   },
   // Web search through DuckDuckGo, no key. Every search goes to the search log (websearch.js).
@@ -291,9 +275,16 @@ async function handleCall(call, ctx = {}) {
     return { decision: 'ran', trust: level, output: res.output, ok: res.ok, seconds: res.seconds ?? (Date.now() - t0) / 1000,
       ...(res.recall ? { recall: res.recall } : {}), ...(res.user_text != null ? { user_text: res.user_text } : {}) };
   }
+  if (call.name === 'ask_someone') {
+    // The guard runs before anything is shown or saved: a held-back question never reaches the approval list.
+    const g = await tool.run(call.args, ctx);
+    if (g.blocked) return { decision: 'refused: search guard', trust: 'ask', output: g.output, ok: false, seconds: 0, ask: g.ask };
+    if (!g.ok) return { decision: 'refused: no question', trust: 'ask', output: g.output, ok: false, seconds: 0 };
+  }
   if (tool.alwaysAsk || level === 'ask') {
     const apr = approvals.addApproval({ convId: ctx.convId, name: call.name, args: call.args });
     const output = call.name === 'remember' ? memory.offerOutput()
+      : call.name === 'ask_someone' ? ASK_TEXT.waiting
       : `${call.name} needs the person's approval each time. Your request has been shown to them. Answer without it for now, and say you have asked.`;
     return { decision: 'waiting for approval', trust: tool.alwaysAsk ? 'ask' : level, approval_id: apr.id, ok: false, output };
   }
@@ -316,5 +307,5 @@ async function runApproved(name, args, ctx = {}) {
   return tool.run(args, ctx);
 }
 
-module.exports = { FETCH_TEXT, TOOLS, MAX_CALLS, trustLevels, offeredSchemas, findCall, handleCall, currentTimeText, runApproved,
-  runPythonSandboxed, dockerArgs };
+module.exports = { FETCH_TEXT, ASK_TEXT, TOOLS, MAX_CALLS, trustLevels, offeredSchemas, findCall, handleCall, currentTimeText, runApproved,
+  };

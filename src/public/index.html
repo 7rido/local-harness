@@ -17,6 +17,7 @@
     --ok:#3f7d2c; --told:#1f6f8b; --bad:#c23b34; --warn:#946018; --user:#ece5d5;
   }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   html, body { height:100%; margin:0; }
   body { background:var(--bg); color:var(--fg); font:13px/1.6 var(--mono); display:grid; grid-template-columns:248px minmax(0,1fr) 340px; overflow:hidden; transition:background .25s, color .25s; }
   button, textarea, input { font:inherit; color:inherit; }
@@ -128,6 +129,7 @@
   .seg { margin-left:auto; display:flex; border:1px solid var(--line); border-radius:10px; padding:2px; background:var(--panel); }
   .seg button { padding:4px 11px; border-radius:8px; color:var(--muted); white-space:nowrap; }
   .seg button[aria-pressed="true"] { background:var(--raise); color:var(--fg); }
+  .seg.th { margin-left:0; }
   .send { flex:none; background:var(--accent); color:#fff; border-radius:11px; width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; }
   .send:disabled { opacity:.45; cursor:default; }
 
@@ -178,6 +180,8 @@
     #modelchip { display:none; }
     .send, .sq { width:44px; height:44px; justify-content:center; } /* finger-sized */
     .seg button { padding:8px 12px; }
+    .row.ctl { flex-wrap:wrap; }
+    .seg.th { order:3; margin-left:auto; }
     .warnbox, .card, pre { overflow-wrap:anywhere; }
   }
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
@@ -202,6 +206,7 @@
   <symbol id="eye" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="2.5"/></symbol>
   <symbol id="menu-i" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
   <symbol id="x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="loop" viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3M18 3v4h-4M6 21v-4h4"/></symbol>
   <symbol id="q" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M9.8 9.5a2.3 2.3 0 1 1 3.3 2.1c-.8.4-1.1 1-1.1 1.9M12 16.5v.3"/></symbol>
 </svg>
 
@@ -214,6 +219,7 @@
   <button class="nav" id="toolsbtn" aria-expanded="false"><span class="ic"><svg><use href="#tool"/></svg></span>Tools<span class="end" id="toolcount"></span></button>
   <div class="sub" id="toollist"></div>
   <button class="nav" id="memorybtn"><span class="ic"><svg><use href="#brain"/></svg></span>Memory<span class="end" id="memcount"></span></button>
+  <button class="nav" id="reviewbtn"><span class="ic"><svg><use href="#loop"/></svg></span>Review<span class="end" id="revcount"></span></button>
   <button class="nav" id="themebtn"><span class="ic"><svg><use href="#theme-i"/></svg></span>Theme<span class="end" id="themename">night</span></button>
   <div class="label">Chats</div>
   <div class="chats" id="chatlist"></div>
@@ -244,6 +250,10 @@
           <button type="button" id="modetools" aria-pressed="true" title="The model may use its tools">Tools</button>
           <button type="button" id="modechat" aria-pressed="false" title="No tools for this reply">Chat</button>
         </div>
+        <div class="seg th" role="group" aria-label="Think harder" id="thinkseg" hidden>
+          <button type="button" id="thinkbtn" aria-pressed="false" title="For one coding question: the model writes 8 answers and its own test inputs, each answer is run in the sandbox, and the one that agrees with most others is shown. About 9 times as long. Name the function, like is_prime(n), so the test inputs can run. It needs Docker.">Think harder</button>
+          <button type="button" id="repairbtn" aria-pressed="false" hidden title="If none of the 8 passes its own test inputs, the model gets one try to fix the closest one.">+ repair</button>
+        </div>
         <button class="send" id="sendbtn" type="submit" aria-label="Send"><svg><use href="#up"/></svg></button>
       </div>
     </form>
@@ -266,6 +276,10 @@
   <header><span>Memory</span><button id="closemem" aria-label="Close memory"><svg><use href="#x"/></svg></button></header>
   <div class="mem" id="membody"></div>
 </div>
+<div class="drawer" id="revdrawer" aria-label="Review">
+  <header><span>Review</span><button id="closerev" aria-label="Close review"><svg><use href="#x"/></svg></button></header>
+  <div class="mem" id="revbody"></div>
+</div>
 <div class="drawer" id="drawer" aria-label="Activity log">
   <header><span>Activity log</span><button id="closelog" aria-label="Close log"><svg><use href="#x"/></svg></button></header>
   <pre id="logtext"></pre>
@@ -280,7 +294,8 @@
   if (params.get('t')) history.replaceState(null, '', '/');
 
   let conv = null, busy = false, longContext = 0, items = [], toolsOn = true, openThinking = false;
-  let convApprovals = [], convNotes = {}, convRecall = {};
+  let convApprovals = [], convNotes = {}, convRecall = {}, convAsks = [], convHabits = {}, convThink = null, teacherName = 'Teacher', teacherEndpoint = false;
+  let reviewOn = false, thinkOn = false, repairOn = false, thinkAllowed = false, repairAllowed = false;
   // Where a note came from, in your words (memory.js keeps "told", "noticed", "wrote").
   const SRC = { told: 'you told the model', noticed: 'the model noticed, you agreed', wrote: 'you wrote it' };
   let emergencyCard = null, lastJson = '', selected = null, pastedBits = [];
@@ -403,8 +418,9 @@
     const box = $('thread'); box.textContent = '';
     for (const m of messages) {
       if (m.author !== 'model') {
-        const label = m.author === 'tool' ? 'Tool result (you approved it)' : 'You';
-        const who = el('div', 'who', label);
+        const label = m.author === 'tool' ? 'Tool result (you approved it)' : m.author === 'teacher' ? teacherName : 'You';
+        const who = el('div', 'who' + (m.author === 'teacher' ? ' model' : ''), label);
+        if (m.author === 'teacher') who.appendChild(el('small', null, 'answer to a question the model asked; not the model'));
         if (m.pasted && m.pasted.length) who.appendChild(el('small', null, 'includes pasted text'));
         box.appendChild(who); box.appendChild(el('div', 'user', m.text));
         continue;
@@ -446,6 +462,15 @@
         more.title = 'Every note the model had in this reply\'s context. "Remembered" marks the ones its words share terms with: a guess, not a record of what it used.';
         more.onclick = () => openMemory(); if (!likely.length || others) line.appendChild(more);
         r.appendChild(line);
+      }
+      // The habits the model had in mind (review.js): the ones you kept from its own mistakes.
+      if (m.memory && (m.memory.habit_ids || []).length) {
+        const line = el('div', 'memline'); line.appendChild(icon('loop'));
+        const kept = m.memory.habit_ids.filter((id) => convHabits[id]);
+        const b = el('button', null, m.memory.habit_ids.length + (m.memory.habit_ids.length === 1 ? ' habit' : ' habits') + ' in mind'
+          + (kept.length < m.memory.habit_ids.length ? ' (' + (m.memory.habit_ids.length - kept.length) + ' since forgotten)' : ''));
+        b.title = kept.map((id) => convHabits[id].kind + ': ' + convHabits[id].habit).join('\n') || 'Habits you have since forgotten';
+        b.onclick = () => openReview(); line.appendChild(b); r.appendChild(line);
       }
       // Pages read with web_fetch: each address, as a link you can open yourself.
       const reads = (m.tools || []).filter((x) => x.name === 'web_fetch' && x.fetch);
@@ -526,16 +551,51 @@
       }
       const meta = el('div', 'meta');
       meta.appendChild(el('span', null, 'first move: ' + m.first_move + (m.finished || m.answer_in_thinking ? '' : ' · cut off')));
+      if (m.think_harder) meta.appendChild(el('span', null, thinkNote(m.think_harder)));
       if (m.stated_confidence != null) meta.appendChild(el('span', null, 'says ' + m.stated_confidence + '% sure · not measured'));
       if (m.check_flags && m.check_flags.length) meta.appendChild(el('span', null, 'unverified: ' + m.check_flags.map((f) => f.match).join(' · ')));
       if (m.context_tokens) meta.appendChild(el('span', null, 'carrying ' + m.context_tokens + ' tokens'));
+      // Mark a wrong answer and give the right one: a miss for the review (only while the review is switched on).
+      if (reviewOn) {
+        const b = el('button', null, 'Mark as a miss'); b.style.color = 'var(--muted)'; b.style.textDecoration = 'underline';
+        b.onclick = async () => {
+          const expected = await askText('What is the right answer? It is used only to check the model later.');
+          if (!expected || !expected.trim()) return;
+          try { await api('POST', '/api/miss', { conv_id: conv, message_id: m.id, expected }); b.textContent = 'logged as a miss'; b.disabled = true; loadReviewCount(); }
+          catch (err) { $('status').textContent = 'Could not log the miss: ' + err.message; }
+        };
+        meta.appendChild(b);
+      }
       r.appendChild(meta);
       box.appendChild(r);
     }
     const lastModel = [...messages].reverse().find((x) => x.author === 'model' && x.context_tokens);
     if (lastModel && longContext && lastModel.context_tokens >= longContext) box.appendChild(el('div', 'long', 'This chat is long (' + lastModel.context_tokens + ' tokens). A small model starts mixing things up around here. A new chat will give clearer answers; this one stays saved.'));
+    // Questions the model put to a teacher, waiting for an answer (node src/cli.js answer <id> "text").
+    for (const a of convAsks) box.appendChild(el('div', 'long', 'The model asked: "' + a.question + '". Waiting for an answer from the ' + teacherName.toLowerCase() + ' (id ' + a.id + ').'));
     // Tool uses that need your yes or no.
     for (const a of convApprovals) {
+      if (a.name === 'ask_someone') {
+        const card = el('div', 'card'); const k = el('div', 'k'); k.style.color = 'var(--warn)'; k.appendChild(icon('q'));
+        k.appendChild(el('span', null, 'The model wants to ask someone this. Send it?')); card.appendChild(k);
+        card.appendChild(el('pre', null, (a.args && a.args.question) || ''));
+        card.appendChild(el('div', 'meta', teacherEndpoint ? 'It will be sent to the teacher endpoint you configured; the text leaves this computer.' : 'No endpoint is set: it is saved as an open question for a person or program to answer with the command line.'));
+        const row = el('div', 'meta');
+        const decide = async (decision) => {
+          busy = true; refresh(true); startLive();
+          try {
+            const r = await api('POST', '/api/approval', { id: a.id, decision });
+            if (r.held_back) $('status').textContent = 'That question had words from your never-send list, notes or name, so it was not sent.';
+            else if (r.teacher_error) $('status').textContent = 'The teacher endpoint failed (' + r.teacher_error + '). The question stays open for the command line.';
+            else if (r.failed) $('status').textContent = "The model couldn't answer: " + r.failed.reason + '.';
+          } catch (err) { $('status').textContent = 'Could not record that: ' + err.message; }
+          busy = false; convLive = null; await refresh(true);
+        };
+        const yes = el('button', 'ghost', 'Send question'); yes.onclick = () => decide('approve');
+        const no = el('button', 'ghost', 'No'); no.onclick = () => decide('reject');
+        row.appendChild(yes); row.appendChild(no); card.appendChild(row); box.appendChild(card);
+        continue;
+      }
       if (a.name === 'remember') {
         // The model's note offer. You can change the words before saving; nothing is kept on No.
         const card = el('div', 'card'); const k = el('div', 'k'); k.style.color = 'var(--told)'; k.appendChild(icon('brain'));
@@ -575,6 +635,7 @@
     // A reply that failed: say so, plainly.
     if (convFailed && !busy && !convLive) box.appendChild(el('div', 'long', "The model couldn't answer: " + convFailed.reason + '. Send your message again.'));
     if (convLive) box.appendChild(liveBox());
+    else if (convThink) box.appendChild(el('div', 'waiting', thinkText(convThink)));
     else if (busy) box.appendChild(liveBox());
   }
 
@@ -687,13 +748,13 @@
   async function refresh(force) {
     if (!conv) return;
     const r = await api('GET', '/api/conv/' + conv);
-    const json = JSON.stringify(r.messages) + busy + openThinking + JSON.stringify(r.approvals || []) + JSON.stringify(r.notes || {}) + JSON.stringify(r.recall_chats || {}) + Boolean(convLive) + JSON.stringify(r.failed || null);
+    const json = JSON.stringify(r.messages) + busy + openThinking + JSON.stringify(r.approvals || []) + JSON.stringify(r.notes || {}) + JSON.stringify(r.recall_chats || {}) + JSON.stringify(r.asks || []) + JSON.stringify(r.think_harder || null) + Boolean(convLive) + JSON.stringify(r.failed || null);
     if (!force && json === lastJson) return;
     // Don't redraw while you are editing a request you are about to approve.
     if (!force && document.activeElement && document.activeElement.isContentEditable) return;
-    lastJson = json; convFailed = r.failed || null;
+    lastJson = json; convFailed = r.failed || null; convThink = r.think_harder || null; convAsks = r.asks || []; convHabits = r.habits || {};
     if (liveConv !== conv) { liveConv = conv; convLive = null; }
-    if (busy || r.writing) startLive();
+    if (busy || r.writing || convThink) startLive();
     convApprovals = r.approvals || []; convNotes = r.notes || {}; convRecall = r.recall_chats || {};
     const sc = $('scroll'); const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 90;
     render(r.messages);
@@ -706,6 +767,28 @@
     renderChatList(); await refresh(true); $('scroll').scrollTop = $('scroll').scrollHeight;
   }
   async function newChat() { const n = await api('POST', '/api/new'); await loadList(); await selectConv(n.conv_id); $('text').focus(); }
+
+  // Think harder: what the page says while it runs, and under the reply afterwards.
+  function minutes(s) { return s < 60 ? 'under a minute' : s < 90 ? '1 min' : Math.round(s / 60) + ' min'; }
+  function thinkText(p) {
+    const tries = (p.total || 9) - 1;
+    if (p.stage === 'fallback') return 'Think harder could not run (' + (p.reason || 'unknown') + '); the model is answering normally…';
+    if (p.stage === 'queued' || p.stage === 'starting') return 'Think harder: starting. The model will write ' + tries + ' answers and its own test inputs; this takes about 9 replies\u2019 worth of time.';
+    if (p.stage === 'tries') return 'Think harder: answer ' + (p.done + 1) + ' of ' + tries + ' being written (stage 1 of 4)';
+    if (p.stage === 'inputs') return 'Think harder: the ' + tries + ' answers are written; the model is writing its test inputs (stage 2 of 4)…';
+    if (p.stage === 'checking') return 'Think harder: running the test inputs on the ' + tries + ' answers in the sandbox (stage 3 of 4)…';
+    if (p.stage === 'repair') return 'Think harder: none passed its own tests; one repair try…';
+    if (p.stage === 'saving') return 'Think harder: answer chosen; saving it…';
+    return 'Think harder: working…';
+  }
+  function thinkNote(t) {
+    if (!t.ran) return 'think harder did not run (' + t.reason + '), so this is a normal reply';
+    const how = t.inputs ? ' · ' + t.inputs + ' test inputs · ' + t.why : ' · no usable test inputs, so this is the first answer that loads';
+    return 'think harder: answer ' + (t.pick + 1) + ' of ' + t.tries + ' shown' + how + (t.repaired ? ' · then repaired' : t.repair_on ? ' · repair was on' : '') + ' · ' + minutes(t.seconds || 0);
+  }
+  function setThink(on) { thinkOn = on; $('thinkbtn').setAttribute('aria-pressed', String(on)); $('repairbtn').hidden = !(on && repairAllowed); if (!on) setRepair(false); }
+  function setRepair(on) { repairOn = on; $('repairbtn').setAttribute('aria-pressed', String(on)); }
+  $('thinkbtn').onclick = () => setThink(!thinkOn); $('repairbtn').onclick = () => setRepair(!repairOn);
 
   function setMode(tools) { toolsOn = tools; $('modetools').setAttribute('aria-pressed', String(tools)); $('modechat').setAttribute('aria-pressed', String(!tools)); }
   $('modetools').onclick = () => setMode(true); $('modechat').onclick = () => setMode(false);
@@ -731,7 +814,11 @@
     if (fromChat.length && await askDanger(fromChat.length + (fromChat.length === 1 ? ' note was' : ' notes were') + ' saved from this chat. Delete ' + (fromChat.length === 1 ? 'it' : 'them') + ' too?')) {
       for (const id of fromChat) { try { await api('POST', '/api/memory/delete', { id }); } catch {} }
     }
-    loadMemoryCount();
+    const habitsFrom = (res && res.habits_from_chat) || [];
+    if (habitsFrom.length && await askDanger(habitsFrom.length + (habitsFrom.length === 1 ? ' habit was' : ' habits were') + ' kept from a mistake in this chat. The chat is gone from it; only the habit\'s own words are left. Delete ' + (habitsFrom.length === 1 ? 'it' : 'them') + ' too?')) {
+      for (const hid of habitsFrom) { try { await api('POST', '/api/review/delete', { id: hid }); } catch {} }
+    }
+    loadMemoryCount(); loadReviewCount();
     if (id !== conv) { await loadList(); return; }
     conv = null; lastJson = ''; await loadList();
     const next = items.find((x) => x.pinned && !x.archived) || items.find((x) => !x.archived);   // never an archived chat
@@ -740,15 +827,17 @@
 
   $('form').onsubmit = async (e) => {
     e.preventDefault(); const text = $('text').value.trim(); if (!text || busy) return;
+    if (convThink) { $('status').textContent = 'The model is still working on your last question (think harder). Send this when it has answered.'; return; }
     if (!conv) await newChat();
     busy = true; $('sendbtn').disabled = true; $('text').value = ''; $('status').textContent = '';
     const pasted = pastedBits.filter((p) => text.includes(p)); pastedBits = [];
-    const send = api('POST', '/api/send', { conv_id: conv, text, tools: toolsOn, pasted });
+    const send = api('POST', '/api/send', { conv_id: conv, text, tools: toolsOn, pasted, ...(thinkOn ? { think_harder: true, repair: repairOn } : {}) });
     setTimeout(() => refresh(true).then(() => { $('scroll').scrollTop = $('scroll').scrollHeight; }).catch(() => {}), 300);
     startLive();
     try {
       const r = await send;
-      if (r.failed) $('status').textContent = "The model couldn't answer: " + r.failed.reason + '. Your message is saved.';
+      if (r.think_harder && r.think_harder.started) $('status').textContent = 'Think harder is on: the answer will appear here when the 8 tries are checked. You can leave this page open or come back later.';
+      else if (r.failed) $('status').textContent = "The model couldn't answer: " + r.failed.reason + '. Your message is saved.';
     } catch (err) { $('status').textContent = 'Something went wrong: ' + err.message; }
     busy = false; $('sendbtn').disabled = false; convLive = null; await loadList(); await refresh(true);
   };
@@ -766,7 +855,7 @@
     box.appendChild(el('div', 'state', r.status.on
       ? 'Memory is on. The model sees these notes at the start of each chat, and asks before saving a new one.'
       : 'Memory is off (' + r.status.why_off + '). You can keep notes here; the model does not see them, and it cannot offer new ones.'));
-    box.appendChild(el('div', 'state', 'Two things leave this computer when you turn them on: the words of web searches (to DuckDuckGo) and the addresses of pages read (to that site). The model writes them itself, so they can include something from these notes or your chats. Each search and page shows under the reply, and the search log is in data/searches.md.'));
+    box.appendChild(el('div', 'state', 'Some things leave this computer when you turn them on: the words of web searches (to DuckDuckGo), the addresses of pages read (to that site), and, if you set a teacher endpoint, the questions you approve for ask_someone (to that URL). The model writes them itself, so they can include something from these notes or your chats. Each search and page shows under the reply, and the search log is in data/searches.md.'));
     box.appendChild(el('div', 'state', 'Forgetting a note deletes it from memory and every log. The chat where it was said stays until you forget that chat too.'));
     box.appendChild(el('div', 'state', 'Looking back: the model searches your earlier chats. Forgetting a chat removes its words from that search and every log, but anything the model later wrote that quotes it (a reply, its thinking, a search) stays until you forget that later chat too.'));
     const add = el('div', 'note'); const ta = el('textarea'); ta.placeholder = 'Write a note for the model to keep…'; ta.maxLength = 300; add.appendChild(ta);
@@ -790,7 +879,71 @@
   }
   $('memorybtn').onclick = () => openMemory(); $('closemem').onclick = () => $('memdrawer').classList.remove('open');
 
+  // ---- The Review page: the model proposes, you decide ----
+  const FOUND = { you: 'you marked it wrong', rule: 'the arithmetic check caught it', model: 'the model found it, reading the chat' };
+  let revTimer = null;
+  async function loadReviewCount() {
+    try { const r = await api('GET', '/api/review'); $('revcount').textContent = r.status.on ? (r.status.offered ? String(r.status.offered) : '') : 'off'; return r; } catch { return null; }
+  }
+  async function openReview() {
+    const r = await loadReviewCount(); if (!r) return;
+    const box = $('revbody'); box.textContent = '';
+    const st = r.status;
+    let line;
+    if (!st.on) line = 'The review is off (' + st.why_off + ').';
+    else if (r.progress) line = (r.progress.stage === 'reading' ? 'The model is reading chats: ' : 'The model is naming the mistakes: ') + r.progress.done + ' of ' + r.progress.total + ' done.';
+    else line = st.last_run ? 'Last review: ' + new Date(st.last_run.ts).toLocaleString() + ' (' + (st.last_run.chats || []).length + ' chats read).' : 'No review yet.';
+    box.appendChild(el('div', 'state', line));
+    if (r.error) box.appendChild(el('div', 'state', 'The last review stopped: ' + r.error));
+    box.appendChild(el('div', 'state', 'The model reads the chats since the last review (the last day, the first time), plus the replies you marked wrong and the arithmetic slips the check caught. For each mistake it names the kind and offers a habit. Nothing is kept without your yes.'));
+    box.appendChild(el('div', 'state', 'A kept habit is shown to the model at the start of each chat while the review and memory are on. It changes how the model works, so your yes is the only check on it. If one carries something personal, change its words before you keep it.'));
+    if (st.on) {
+      const go = el('button', 'ghost', r.progress ? 'Review running…' : 'Review now'); go.disabled = Boolean(r.progress);
+      go.onclick = async () => { try { await api('POST', '/api/review/run'); } catch (err) { tell(err.message); } openReview(); };
+      box.appendChild(go);
+    }
+    const offered = r.cases.filter((c) => c.status === 'offered'); const kept = r.cases.filter((c) => c.status === 'kept');
+    const chatLink = (c, acts) => { if (c.conv_id && r.chats[c.conv_id]) { const b = el('button', 'ghost', 'Open the chat: ' + r.chats[c.conv_id]); b.onclick = () => { $('revdrawer').classList.remove('open'); selectConv(c.conv_id); }; acts.appendChild(b); } };
+    box.appendChild(el('div', 'label', offered.length ? 'Waiting for your yes' : ''));
+    for (const c of offered) {
+      const card = el('div', 'note');
+      card.appendChild(el('div', 'src', FOUND[c.found_by] || c.found_by));
+      if (c.what) card.appendChild(el('div', 't', 'What went wrong, in the model\'s words: ' + c.what));
+      const kind = el('textarea'); kind.value = c.kind || ''; kind.placeholder = 'The kind of mistake (the model could not name it: write it, or drop this)'; kind.maxLength = 200;
+      const habit = el('textarea'); habit.value = c.habit || ''; habit.placeholder = 'The habit'; habit.maxLength = 200;
+      card.appendChild(el('div', 'src', 'Kind of mistake')); card.appendChild(kind);
+      card.appendChild(el('div', 'src', 'Habit offered')); card.appendChild(habit);
+      const acts = el('div', 'acts');
+      const keep = el('button', 'ghost', 'Keep habit'); keep.onclick = async () => { try { await api('POST', '/api/review/decide', { id: c.id, decision: 'keep', kind: kind.value, habit: habit.value }); } catch (err) { tell(err.message); } openReview(); };
+      const drop = el('button', 'ghost', 'Drop'); drop.onclick = async () => { try { await api('POST', '/api/review/decide', { id: c.id, decision: 'drop' }); } catch (err) { tell(err.message); } openReview(); };
+      acts.appendChild(keep); acts.appendChild(drop); chatLink(c, acts); card.appendChild(acts); box.appendChild(card);
+    }
+    box.appendChild(el('div', 'label', 'Habits'));
+    if (!kept.length) box.appendChild(el('div', 'state', 'No habits yet.'));
+    for (const c of kept) {
+      const card = el('div', 'note');
+      card.appendChild(el('div', 't', c.habit)); card.appendChild(el('div', 'src', 'Kind: ' + c.kind));
+      const bits = [FOUND[c.found_by] || c.found_by, new Date(c.decided).toLocaleDateString()];
+      if (c.final_text_by === 'user') bits.push('words edited by you');
+      if (c.from_forgotten) bits.push('from a chat you have since forgotten');
+      card.appendChild(el('div', 'src', bits.join(' · ')));
+      const acts = el('div', 'acts');
+      const ed = el('button', 'ghost', 'Edit'); ed.onclick = async () => { const h = await askText('Change the habit (the old words are not kept):', c.habit); if (h == null) return; const k = await askText('The kind of mistake:', c.kind); if (k == null) return; try { await api('POST', '/api/review/edit', { id: c.id, kind: k, habit: h }); } catch (err) { tell(err.message); } openReview(); };
+      const del = el('button', 'ghost', 'Forget'); del.onclick = async () => { if (!await askDanger('Forget this habit? Its words are deleted for good.')) return; try { await api('POST', '/api/review/delete', { id: c.id }); } catch (err) { tell(err.message); } openReview(); };
+      acts.appendChild(ed); acts.appendChild(del); chatLink(c, acts); card.appendChild(acts); box.appendChild(card);
+    }
+    $('revdrawer').classList.add('open');
+    clearTimeout(revTimer);
+    if (r.progress) revTimer = setTimeout(() => { if ($('revdrawer').classList.contains('open')) openReview(); }, 4000);
+  }
+  $('reviewbtn').onclick = () => openReview(); $('closerev').onclick = () => { clearTimeout(revTimer); $('revdrawer').classList.remove('open'); };
+
   function showInfo(info) {
+    teacherName = (info.teacher && info.teacher.name) || 'Teacher'; teacherEndpoint = Boolean(info.teacher && info.teacher.endpoint);
+    reviewOn = Boolean(info.review && info.review.switched_on);
+    thinkAllowed = Boolean(info.think_harder && info.think_harder.on); repairAllowed = Boolean(info.think_harder && info.think_harder.repair);
+    $('thinkseg').hidden = !thinkAllowed; if (!thinkAllowed && thinkOn) setThink(false); else $('repairbtn').hidden = !(thinkOn && repairAllowed);
+    $('revcount').textContent = info.review ? (info.review.on ? (info.review.offered ? String(info.review.offered) : '') : 'off') : '';
     longContext = info.long_context_tokens || 0; emergencyCard = info.emergency_card || null;
     const name = (info.model && info.model.id) || 'unknown model';
     $('modelname').textContent = name;

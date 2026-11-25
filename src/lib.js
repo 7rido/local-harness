@@ -14,6 +14,9 @@ const AUTHORS = {
   // The result of a tool run the user approved after the model's reply. Machine text.
   tool: { source: 'tool', label: 'Tool result' },
   model: { source: 'model', label: null },
+  // The answer to a question the model put to a second voice (the ask_someone tool). Never the model's own text.
+  // The label is what the model sees in front of the text, and what the page shows.
+  teacher: { source: 'teacher', get label() { return process.env.LH_TEACHER_NAME || 'Teacher'; } },
 };
 
 // The thinking caveat shown at the top of every readable log.
@@ -120,7 +123,7 @@ function skipFacts(reply, { history = [], systemPrompt = '', messages = [], cont
   const asked = [...history].reverse().find((m) => m.author !== 'model');
   if (asked) {
     const n = (asked.text || '').length;
-    facts.push(`answering ${asked.author === 'tool' ? 'a tool result' : 'the user'} (${n < 40 ? 'a short message' : `${n} characters`})`);
+    facts.push(`answering ${asked.author === 'tool' ? 'a tool result' : asked.author === 'teacher' ? 'the teacher' : 'the user'} (${n < 40 ? 'a short message' : `${n} characters`})`);
   }
   if (contextTokens) facts.push(`carrying ${contextTokens} tokens`);
   return facts;
@@ -469,7 +472,7 @@ function renderLogMarkdown(convId, events) {
   let turn = 0;
   for (const e of events) {
     if (e.type === 'message' && e.author !== 'model') {
-      const who = e.author === 'tool' ? 'Tool result' : 'User';
+      const who = e.author === 'tool' ? 'Tool result' : e.author === 'teacher' ? AUTHORS.teacher.label : 'User';
       lines.push(`**${who}** (${e.ts}): ${e.text}`, '');
     } else if (e.type === 'model_call') {
       turn += 1;

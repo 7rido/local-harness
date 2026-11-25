@@ -5,5 +5,9 @@
   "web_fetch": "off",
   "run_python": "off",
   "memory": "off",
+  "review": "off",
+  "think_harder": "off",
+  "think_harder_repair": "off",
+  "ask_someone": "off",
   "search_never_send": []
 }
